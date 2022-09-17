@@ -37,7 +37,6 @@ import jaxlib
 import numpy as np
 import optax
 import transformers
-import wandb
 from datasets import Dataset
 from flax import core, struct, traverse_util
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
@@ -51,6 +50,7 @@ from tqdm import tqdm
 from transformers import HfArgumentParser
 
 import dalle_mini
+import wandb
 from dalle_mini.data import Dataset
 from dalle_mini.model import (
     DalleBart,
@@ -243,6 +243,18 @@ class DataTrainingArguments:
         default=None,
         metadata={"help": "Maximum clip score required."},
     )
+    object_num_column: Optional[str] = field(
+        default="object_num",
+        metadata={"help": "Column that containts object number for filtering."},
+    )
+    min_num_object: Optional[int] = field(
+        default=None,
+        metadata={"help": "Minimum object number required."},
+    )
+    max_num_object: Optional[float] = field(
+        default=None,
+        metadata={"help": "Maximum object number required."},
+    )
     filter_column: Optional[str] = field(
         default=None,
         metadata={"help": "Column that containts classes to be filtered."},
@@ -267,6 +279,26 @@ class DataTrainingArguments:
         default=None,
         metadata={
             "help": "For debugging purposes or quicker training, truncate the number of evaluation examples."
+        },
+    )
+    caption_sep_tok: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Split a mega caption into mini captions by a separating token."
+        },
+    )
+    max_num_caption: Optional[int] = field(
+        default=1000,
+        metadata={"help": "Random select max subset of mini captions."},
+    )
+    min_num_caption: Optional[int] = field(
+        default=1,
+        metadata={"help": "Random select min subset of mini captions."},
+    )
+    do_reprocessing: Optional[bool] = field(
+        default=False,
+        metadata={
+            "help": "Re-process train data to select a random subset of mini captions."
         },
     )
     preprocessing_num_workers: Optional[int] = field(
@@ -1042,9 +1074,10 @@ def main():
                 opt_state[k] = new_opt_state
             params = unsplit_params(params)
             # merge with non-trainable params
-            params, new_params = traverse_util.flatten_dict(
-                unfreeze(self.params)
-            ), traverse_util.flatten_dict(unfreeze(params))
+            params, new_params = (
+                traverse_util.flatten_dict(unfreeze(self.params)),
+                traverse_util.flatten_dict(unfreeze(params)),
+            )
             params.update(new_params)
             params = freeze(traverse_util.unflatten_dict(params))
 
@@ -1643,6 +1676,10 @@ def main():
             # ======================== Training ================================
             metrics_logger.update_state_metrics(local_state)
             metrics_logger.log({})
+
+            if epoch > 0 and data_args.do_reprocessing:
+                logger.info(f" Reprocess train data #epoch {epoch}")
+                dataset.reprocess(tokenizer=tokenizer, config=model.config)
 
             if training_args.do_train:
                 # load data - may be replicated on multiple nodes

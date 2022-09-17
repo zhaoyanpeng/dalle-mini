@@ -1,4 +1,5 @@
 import random
+from copy import deepcopy
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
@@ -23,6 +24,10 @@ class Dataset:
     encoding_column: str = "encoding"
     max_train_samples: int = None
     max_eval_samples: int = None
+    caption_sep_tok: str = None
+    max_num_caption: int = 1000
+    min_num_caption: int = 1
+    do_reprocessing: bool = False
     preprocessing_num_workers: int = None
     overwrite_cache: bool = False
     do_train: bool = False
@@ -31,6 +36,9 @@ class Dataset:
     shard_by_host: bool = False
     blank_caption_prob: float = 0.0
     clip_score_column: str = "clip_score"
+    min_num_object: int = None
+    max_num_object: int = None
+    object_num_column: str = None
     min_clip_score: float = None
     max_clip_score: float = None
     filter_column: str = None
@@ -118,13 +126,60 @@ class Dataset:
                 self.eval_dataset = (
                     self.eval_dataset.take(self.max_eval_samples)
                     if self.streaming
-                    else self.eval_dataset.select(range(self.max_eval_samples))
+                    else self.eval_dataset.select(
+                        # np.random.default_rng(1314).choice(
+                        #    len(self.eval_dataset), self.max_eval_samples, replace=False
+                        # )
+                        range(self.max_eval_samples)
+                    )
                 )
             # other eval datasets
             other_eval_splits = dataset.keys() - {"train", "validation"}
             self.other_eval_datasets = {
                 split: dataset[split] for split in other_eval_splits
             }
+
+    def reprocess(self, tokenizer, config, split="train"):
+        # make a copy of the backup dataset
+        ds = f"{split}_dataset"
+        ds_cp = f"_{ds}_copy"
+        if self.streaming or not hasattr(self, ds) or not hasattr(self, ds_cp):
+            # print(f"-->> RETURN me, {self.streaming} {hasattr(self, ds)} {hasattr(self, ds_cp)}")
+            return  # streaming will re-expand partial functions every epoch
+        setattr(self, ds, deepcopy(getattr(self, ds_cp)))
+
+        # get required config variables
+        decoder_start_token_id = config.decoder_start_token_id
+        normalize_text = config.normalize_text
+        max_length = config.max_text_length
+
+        # preprocess
+        partial_preprocess_function = partial(
+            preprocess_function, **self.shared_processing_params
+        )
+        setattr(
+            self,
+            ds,
+            (
+                getattr(self, ds).map(
+                    partial_preprocess_function,
+                    batched=True,
+                    remove_columns=[
+                        self.text_column,
+                        self.encoding_column,
+                    ],
+                )
+                if self.streaming
+                else getattr(self, ds).map(
+                    partial_preprocess_function,
+                    batched=True,
+                    remove_columns=getattr(getattr(self, ds), "column_names"),
+                    num_proc=self.preprocessing_num_workers,
+                    load_from_cache_file=False,  # to select captions randomly
+                    desc="Reprocessing datasets",
+                )
+            ),
+        )
 
     def preprocess(self, tokenizer, config):
         # get required config variables
@@ -149,6 +204,9 @@ class Dataset:
             clip_score_column=self.clip_score_column,
             min_clip_score=self.min_clip_score,
             max_clip_score=self.max_clip_score,
+            min_num_object=self.min_num_object,
+            max_num_object=self.max_num_object,
+            object_num_column=self.object_num_column,
         )
         for ds in ["train_dataset", "eval_dataset"]:
             if hasattr(self, ds):
@@ -242,16 +300,33 @@ class Dataset:
                     )
                 )
 
+        if (
+            not self.streaming
+            and self.do_reprocessing
+            and hasattr(self, "train_dataset")
+        ):
+            self._train_dataset_copy = deepcopy(self.train_dataset)
+
         # preprocess
+        shared_processing_params = {
+            "tokenizer": tokenizer,
+            "text_column": self.text_column,
+            "encoding_column": self.encoding_column,
+            "max_length": max_length,
+            "decoder_start_token_id": decoder_start_token_id,
+            "caption_sep_tok": self.caption_sep_tok,
+            "max_num_caption": self.max_num_caption,
+            "min_num_caption": self.min_num_caption,
+        }
+        dataset_key = "dataset"
         partial_preprocess_function = partial(
-            preprocess_function,
-            tokenizer=tokenizer,
-            text_column=self.text_column,
-            encoding_column=self.encoding_column,
-            max_length=max_length,
-            decoder_start_token_id=decoder_start_token_id,
+            preprocess_function, **shared_processing_params
         )
         for ds in ["train_dataset", "eval_dataset"]:
+            shared_processing_params.update({dataset_key: ds})
+            partial_preprocess_function = partial(
+                preprocess_function, **shared_processing_params
+            )
             if hasattr(self, ds):
                 setattr(
                     self,
@@ -269,14 +344,20 @@ class Dataset:
                         else getattr(self, ds).map(
                             partial_preprocess_function,
                             batched=True,
-                            remove_columns=getattr(ds, "column_names"),
+                            remove_columns=getattr(getattr(self, ds), "column_names"),
                             num_proc=self.preprocessing_num_workers,
-                            load_from_cache_file=not self.overwrite_cache,
+                            load_from_cache_file=(
+                                not self.overwrite_cache
+                            ),  # and not self.do_reprocessing),
                             desc="Preprocessing datasets",
                         )
                     ),
                 )
         if hasattr(self, "other_eval_datasets"):
+            shared_processing_params.update({dataset_key: "other_eval_datasets"})
+            partial_preprocess_function = partial(
+                preprocess_function, **shared_processing_params
+            )
             self.other_eval_datasets = {
                 split: (
                     ds.map(
@@ -291,14 +372,18 @@ class Dataset:
                     else ds.map(
                         partial_preprocess_function,
                         batched=True,
-                        remove_columns=getattr(ds, "column_names"),
+                        remove_columns=getattr(getattr(self, ds), "column_names"),
                         num_proc=self.preprocessing_num_workers,
-                        load_from_cache_file=not self.overwrite_cache,
+                        load_from_cache_file=(
+                            not self.overwrite_cache
+                        ),  # and not self.do_reprocessing),
                         desc="Preprocessing datasets",
                     )
                 )
                 for split, ds in self.other_eval_datasets.items()
             }
+        shared_processing_params.pop(dataset_key, None)
+        self.shared_processing_params = shared_processing_params
 
     def dataloader(self, split, batch_size, epoch=None):
         def _dataloader_datasets_non_streaming(
@@ -362,6 +447,7 @@ class Dataset:
         if self.streaming:
             return _dataloader_datasets_streaming(ds, epoch)
         else:
+            input_rng = None
             if split == "train":
                 self.rng_dataset, input_rng = jax.random.split(self.rng_dataset)
             return _dataloader_datasets_non_streaming(ds, input_rng)
@@ -417,12 +503,19 @@ def filter_function(
     clip_score_column,
     filter_column,
     filter_value,
+    min_num_object=None,
+    max_num_object=None,
+    object_num_column=None,
 ):
     if min_clip_score is not None and example[clip_score_column] < min_clip_score:
         return False
     if max_clip_score is not None and example[clip_score_column] > max_clip_score:
         return False
     if filter_column is not None and example[filter_column] != filter_value:
+        return False
+    if min_num_object is not None and example[object_num_column] < min_num_object:
+        return False
+    if max_num_object is not None and example[object_num_column] > max_num_object:
         return False
     return True
 
@@ -434,8 +527,41 @@ def preprocess_function(
     encoding_column,
     max_length,
     decoder_start_token_id,
+    caption_sep_tok=None,
+    max_num_caption=100,
+    min_num_caption=1,
+    dataset="train_dataset",
 ):
     inputs = examples[text_column]
+    # print(f"{examples['image']}\n")
+    # print("\n\n".join(inputs))
+    train = "train" in dataset  # no randomness in eval data
+    if caption_sep_tok is not None and caption_sep_tok != "":
+        new_inputs = list()
+        for caption in inputs:
+            caption = caption.split(caption_sep_tok)
+            nsample = len(caption)
+            if not train or max_num_caption >= nsample:
+                sample = " ".join(caption)
+                new_inputs.append(sample)
+                continue
+            assert (
+                min_num_caption < max_num_caption + 1
+            ), f"min ({min_num_caption}) <= max ({max_num_caption})"
+            k = (
+                1
+                if max_num_caption == 1
+                else np.random.choice(range(min_num_caption, max_num_caption + 1), 1)[0]
+            )
+            caption[0] = caption[0].strip()
+            caption[-1] = caption[-1] + ","  # may be swapped in
+            indice = np.random.choice(nsample, k, replace=False)
+            sample = " ".join([caption[i] for i in indice])
+            sample = sample[:-1] if sample[-1] == "," else sample
+            sample = " " + sample if sample[0] != " " else sample
+            new_inputs.append(sample)
+        inputs = new_inputs
+
     # Setting padding="max_length" as we need fixed length inputs for jitted functions
     model_inputs = tokenizer(
         inputs,
@@ -444,6 +570,15 @@ def preprocess_function(
         truncation=True,
         return_tensors="np",
     )
+
+    # print("\nAFTER RND SELECTION\n")
+    # print("\n\n".join(inputs))
+    # xids = model_inputs["input_ids"]
+    # print(xids.shape)
+    # xids = xids.tolist()
+    # print("\n\n".join(
+    #    [tokenizer.decode(x) for x in xids]
+    # ))
 
     # set up targets
     # Note: labels correspond to our target indices
