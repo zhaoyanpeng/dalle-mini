@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 
+import datasets
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -59,7 +60,7 @@ class Dataset:
         self.multi_hosts = jax.process_count() > 1
         # feed blank captions only in streaming mode for now
         # otherwise dataset could be cached with same blanked captions
-        if self.blank_caption_prob:
+        if False and self.blank_caption_prob:  # FIXME disabled
             assert (
                 self.streaming is True
             ), "blank_caption_prob can only be used in streaming mode"
@@ -152,6 +153,27 @@ class Dataset:
         decoder_start_token_id = config.decoder_start_token_id
         normalize_text = config.normalize_text
         max_length = config.max_text_length
+
+        # blank captions
+        if self.blank_caption_prob:
+            partial_blank_caption_function = partial(
+                blank_caption_function,
+                text_column=self.text_column,
+                blank_caption_prob=self.blank_caption_prob,
+                rng=self.np_rng,
+            )
+            self.train_dataset = (
+                self.train_dataset.map(partial_blank_caption_function)
+                if self.streaming
+                else self.train_dataset.map(
+                    partial_blank_caption_function,
+                    num_proc=None
+                    if self.seed_dataset
+                    else self.preprocessing_num_workers,
+                    load_from_cache_file=False,
+                    desc="Blanking some captions",
+                )
+            )
 
         # preprocess
         partial_preprocess_function = partial(
@@ -278,6 +300,13 @@ class Dataset:
                     for split, ds in self.other_eval_datasets.items()
                 }
 
+        if (
+            not self.streaming
+            and self.do_reprocessing
+            and hasattr(self, "train_dataset")
+        ):
+            self._train_dataset_copy = deepcopy(self.train_dataset)
+
         # blank captions
         if self.blank_caption_prob:
             partial_blank_caption_function = partial(
@@ -299,13 +328,6 @@ class Dataset:
                         desc="Blanking some captions",
                     )
                 )
-
-        if (
-            not self.streaming
-            and self.do_reprocessing
-            and hasattr(self, "train_dataset")
-        ):
-            self._train_dataset_copy = deepcopy(self.train_dataset)
 
         # preprocess
         shared_processing_params = {
@@ -347,7 +369,7 @@ class Dataset:
                             remove_columns=getattr(getattr(self, ds), "column_names"),
                             num_proc=self.preprocessing_num_workers,
                             load_from_cache_file=(
-                                not self.overwrite_cache
+                                False  # not self.overwrite_cache
                             ),  # and not self.do_reprocessing),
                             desc="Preprocessing datasets",
                         )
@@ -375,7 +397,7 @@ class Dataset:
                         remove_columns=getattr(getattr(self, ds), "column_names"),
                         num_proc=self.preprocessing_num_workers,
                         load_from_cache_file=(
-                            not self.overwrite_cache
+                            False  # not self.overwrite_cache
                         ),  # and not self.do_reprocessing),
                         desc="Preprocessing datasets",
                     )
@@ -384,6 +406,7 @@ class Dataset:
             }
         shared_processing_params.pop(dataset_key, None)
         self.shared_processing_params = shared_processing_params
+        datasets.disable_progress_bar()  # globally effective
 
     def dataloader(self, split, batch_size, epoch=None):
         def _dataloader_datasets_non_streaming(
@@ -534,7 +557,7 @@ def preprocess_function(
 ):
     inputs = examples[text_column]
     # print(f"{examples['image']}\n")
-    # print("\n\n".join(inputs))
+    # print("\n\n".join([f"|{x}|" for x in inputs]))
     train = "train" in dataset  # no randomness in eval data
     if caption_sep_tok is not None and caption_sep_tok != "":
         new_inputs = list()
@@ -572,7 +595,7 @@ def preprocess_function(
     )
 
     # print("\nAFTER RND SELECTION\n")
-    # print("\n\n".join(inputs))
+    # print("\n\n".join([f"|{x}|" for x in inputs]))
     # xids = model_inputs["input_ids"]
     # print(xids.shape)
     # xids = xids.tolist()
