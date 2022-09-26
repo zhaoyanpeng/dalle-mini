@@ -394,7 +394,7 @@ class Dataset:
                     else ds.map(
                         partial_preprocess_function,
                         batched=True,
-                        remove_columns=getattr(getattr(self, ds), "column_names"),
+                        remove_columns=getattr(ds, "column_names"),
                         num_proc=self.preprocessing_num_workers,
                         load_from_cache_file=(
                             False  # not self.overwrite_cache

@@ -26,6 +26,7 @@ import os
 import sys
 import tempfile
 import time
+from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from functools import partial
 from pathlib import Path
@@ -143,7 +144,7 @@ class ModelArguments:
         ppath = f"{self.model_name_or_path}/wandb/offline*/run-*.wandb"
         paths = glob.glob(ppath)
         if len(paths) != 1:
-            return False, dict()
+            return dict()
 
         expected_type = "summary"
         required_keys = {"train/step", "train/epoch", "train/time", "train/samples"}
@@ -174,10 +175,12 @@ class ModelArguments:
                 break
         if "epoch" in ret_dict:
             ret_dict["epoch"] += 1
-        return ret_dict  # , found
+        return ret_dict
 
     def get_metadata(self):
-        if os.path.isdir(self.model_name_or_path):
+        if isinstance(self.model_name_or_path, str) and os.path.isdir(
+            self.model_name_or_path
+        ):
             return self.get_metadata_from_local_wandb()
         elif self.model_name_or_path is not None and ":" in self.model_name_or_path:
             if jax.process_index() == 0:
@@ -901,8 +904,9 @@ def main():
     )
     num_params = model.num_params(params_shape)
 
+    num_sample = len_train_dataset if training_args.do_train else len_eval_dataset
     logger.info("***** Running training *****")
-    logger.info(f"  Num examples = {len_train_dataset}")
+    logger.info(f"  Num examples = {num_sample}")
     logger.info(f"  Num Epochs = {num_epochs}")
     logger.info(
         f"  Batch size per dp device = {training_args.per_device_train_batch_size}"
@@ -1016,7 +1020,9 @@ def main():
         )
         return schedule_fn
 
-    learning_rate_fn = create_learning_rate_fn()
+    learning_rate_fn = (
+        create_learning_rate_fn() if training_args.do_train else lambda x: x
+    )
 
     # create optimizer
     trainable_params_shape = trainable_params(
@@ -1108,6 +1114,8 @@ def main():
             weight_decay_rate=training_args.weight_decay,
         )
         optimizer = {k: optimizer for k in split_params(trainable_params_shape)}
+    else:
+        optimizer = {}
 
     # get PartitionSpec for optimizer state
     def get_opt_state_spec_and_shape():
@@ -1330,6 +1338,17 @@ def main():
         loss = loss.mean()
         return loss
 
+    def ppl_fn(logits, labels):
+        ppl = -(jax.nn.log_softmax(logits, -1) * onehot(labels, logits.shape[-1])).sum(
+            -1
+        )
+        ppl = jax.lax.exp(ppl.mean())
+        return ppl
+
+    def acc_fn(logits, labels):
+        acc = (logits.argmax(-1) == labels).mean() * 100
+        return acc
+
     # "vmap trick" avoids a crash when mp_devices > 1 (not sure why it happens)
     # lead to better perf: see https://wandb.ai/dalle-mini/dalle-mini/reports/JAX-pmap-vs-pjit--VmlldzoxNDg1ODA2
     use_vmap_trick = training_args.use_vmap_trick
@@ -1516,14 +1535,18 @@ def main():
         def compute_eval_loss(batch):
             batch, labels = batch.pop("labels")
             logits = eval_model(**batch, params=state.params, train=False)[0]
-            return loss_fn(logits, labels)
+            return {
+                "loss": loss_fn(logits, labels),
+                # "ppl": ppl_fn(logits, labels), # basically exp(loss)
+                "acc": acc_fn(logits, labels),
+            }
 
         if use_vmap_trick:
             loss = jax.vmap(compute_eval_loss)(batch)
             # ensure they are sharded correctly
-            loss = with_sharding_constraint(loss, batch_spec)
+            loss = {k: with_sharding_constraint(v, batch_spec) for k, v in loss.items()}
             # average across all devices
-            loss = jnp.mean(loss)
+            loss = {k: jnp.mean(v) for k, v in loss.items()}
         else:
             loss = compute_eval_loss(batch)
 
@@ -1648,7 +1671,7 @@ def main():
                     if len_eval_dataset is not None
                     else None
                 )
-                eval_loss = []
+                eval_metrics = defaultdict(list)
                 for batch in tqdm(
                     eval_loader,
                     desc="Evaluating...",
@@ -1682,18 +1705,19 @@ def main():
                     # freeze batch to pass safely to jax transforms
                     batch = freeze(batch)
                     # accumulate losses async
-                    eval_loss.append(p_eval_step(state, batch))
-
-                # get the mean of the loss
-                eval_loss = jnp.stack(eval_loss)
-                eval_loss = jnp.mean(eval_loss)
-                eval_metrics = {"loss": eval_loss}
+                    loss = p_eval_step(state, batch)
+                    for k, v in loss.items():
+                        eval_metrics[k].append(v)
+                eval_metrics = {k: jnp.stack(v).mean() for k, v in eval_metrics.items()}
 
                 # log metrics
                 metrics_logger.log(eval_metrics, prefix=val_dataset)
 
                 # Print metrics and update progress bar
-                desc = f"Epoch... ({epoch + 1}/{num_epochs} | {val_dataset} Loss: {eval_metrics['loss']})"
+                info = " ".join(
+                    f"{k.lower()}: {v:.5f}" for k, v in eval_metrics.items()
+                )
+                desc = f"Epoch... ({epoch + 1}/{num_epochs} | {val_dataset} {info})"
                 epochs.write(desc)
                 epochs.desc = desc
 
@@ -1909,12 +1933,16 @@ def main():
                 eval_metrics = run_evaluation()
 
             # save checkpoint after each epoch
-            if not save_model_ran and (  # let's save some time
-                training_args.save_epoch
-                or (
-                    training_args.save_final
-                    and epoch + 1 == training_args.num_train_epochs
+            if (
+                not save_model_ran
+                and (  # let's save some time
+                    training_args.save_epoch
+                    or (
+                        training_args.save_final
+                        and epoch + 1 == training_args.num_train_epochs
+                    )
                 )
+                and training_args.do_train
             ):
                 run_save_model(state, eval_metrics)
 

@@ -37,6 +37,7 @@ import jaxlib
 import numpy as np
 import optax
 import transformers
+import wandb
 from datasets import Dataset
 from flax import core, struct, traverse_util
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
@@ -50,7 +51,6 @@ from tqdm import tqdm
 from transformers import HfArgumentParser
 
 import dalle_mini
-import wandb
 from dalle_mini.data import Dataset
 from dalle_mini.model import (
     DalleBart,
