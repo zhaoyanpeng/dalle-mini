@@ -1,4 +1,5 @@
 import random
+import re
 from copy import deepcopy
 from dataclasses import dataclass, field
 from functools import partial
@@ -40,6 +41,12 @@ class Dataset:
     min_num_object: int = None
     max_num_object: int = None
     object_num_column: str = None
+    min_train_vid: int = None
+    max_train_vid: int = None
+    train_divider: int = None
+    min_eval_vid: int = None
+    max_eval_vid: int = None
+    eval_divider: int = None
     min_clip_score: float = None
     max_clip_score: float = None
     filter_column: str = None
@@ -219,18 +226,33 @@ class Dataset:
             self.rng_dataset = jax.random.PRNGKey(self.seed_dataset)
 
         # filter data
-        partial_filter_function = partial(
-            filter_function,
-            filter_column=self.filter_column,
-            filter_value=self.filter_value,
-            clip_score_column=self.clip_score_column,
-            min_clip_score=self.min_clip_score,
-            max_clip_score=self.max_clip_score,
-            min_num_object=self.min_num_object,
-            max_num_object=self.max_num_object,
-            object_num_column=self.object_num_column,
-        )
+        shared_filter_params = {
+            "filter_column": self.filter_column,
+            "filter_value": self.filter_value,
+            "clip_score_column": self.clip_score_column,
+            "min_clip_score": self.min_clip_score,
+            "max_clip_score": self.max_clip_score,
+            "min_num_object": self.min_num_object,
+            "max_num_object": self.max_num_object,
+            "object_num_column": self.object_num_column,
+        }
         for ds in ["train_dataset", "eval_dataset"]:
+            if "train" in ds:
+                divider = self.train_divider
+                min_vid = max(self.min_train_vid, 0)
+                max_vid = min(self.max_train_vid, 1e9)
+            else:
+                divider = self.eval_divider
+                min_vid = max(self.min_eval_vid, 0)
+                max_vid = min(self.max_eval_vid, 1e9)
+            shared_filter_params.update(
+                {
+                    "divider": divider,
+                    "min_vid": min_vid,
+                    "max_vid": max_vid,
+                }
+            )
+            partial_filter_function = partial(filter_function, **shared_filter_params)
             if hasattr(self, ds):
                 setattr(
                     self,
@@ -247,6 +269,8 @@ class Dataset:
                     ),
                 )
         if hasattr(self, "other_eval_datasets"):
+            shared_filter_params.update({"divider": None})
+            partial_filter_function = partial(filter_function, **shared_filter_params)
             self.other_eval_datasets = {
                 split: (
                     ds.filter(partial_filter_function)
@@ -529,6 +553,9 @@ def filter_function(
     min_num_object=None,
     max_num_object=None,
     object_num_column=None,
+    divider=None,
+    min_vid=None,
+    max_vid=None,
 ):
     if min_clip_score is not None and example[clip_score_column] < min_clip_score:
         return False
@@ -540,6 +567,14 @@ def filter_function(
         return False
     if max_num_object is not None and example[object_num_column] > max_num_object:
         return False
+    if divider is not None:
+        try:
+            x = example["image"]
+            x = re.match(".*?_(\d+)\.png", x)
+            x = int(x.groups()[0]) % divider
+            return False if x < min_vid or x > max_vid else True
+        except Exception as e:
+            return False
     return True
 
 

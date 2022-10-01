@@ -306,9 +306,33 @@ class DataTrainingArguments:
         default=None,
         metadata={"help": "Minimum object number required."},
     )
-    max_num_object: Optional[float] = field(
+    max_num_object: Optional[int] = field(
         default=None,
         metadata={"help": "Maximum object number required."},
+    )
+    min_train_vid: Optional[int] = field(
+        default=0,
+        metadata={"help": "Minimum image id = vid % divider."},
+    )
+    max_train_vid: Optional[int] = field(
+        default=1e9,
+        metadata={"help": "Maximum image id = vid % divider."},
+    )
+    train_divider: Optional[int] = field(
+        default=None,
+        metadata={"help": "The divider specific to CLEVR."},
+    )
+    min_eval_vid: Optional[int] = field(
+        default=0,
+        metadata={"help": "Minimum image id = vid % divider."},
+    )
+    max_eval_vid: Optional[int] = field(
+        default=1e9,
+        metadata={"help": "Maximum image id = vid % divider."},
+    )
+    eval_divider: Optional[int] = field(
+        default=None,
+        metadata={"help": "The divider specific to CLEVR."},
     )
     filter_column: Optional[str] = field(
         default=None,
@@ -799,6 +823,7 @@ def main():
 
     # Set the verbosity to info of the Transformers logger (on main process only):
     logger.info(f"Training/evaluation parameters {training_args}")
+    logger.info(f"Dataset parameters {data_args}")
 
     # Load dataset
     dataset = Dataset(
@@ -906,8 +931,8 @@ def main():
 
     num_sample = len_train_dataset if training_args.do_train else len_eval_dataset
     logger.info("***** Running training *****")
-    logger.info(f"  Num examples = {num_sample}")
-    logger.info(f"  Num Epochs = {num_epochs}")
+    logger.info(f"  Num examples = {len_train_dataset} / {len_eval_dataset}")
+    logger.info(f"  Num epochs = {num_epochs}")
     logger.info(
         f"  Batch size per dp device = {training_args.per_device_train_batch_size}"
     )
